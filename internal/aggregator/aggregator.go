@@ -117,6 +117,7 @@ func (a *Aggregator) Ingest(ev domain.NormalizedEvent) IngestResult {
 	b := &a.buckets[a.bucketIndex(epoch)]
 	b.mu.Lock()
 	if b.epoch != epoch {
+		a.expireBucketLocked(b)
 		b.epoch = epoch
 	}
 	delta := Counters{Raw: 1, Score: scoreDelta}
@@ -129,6 +130,44 @@ func (a *Aggregator) Ingest(ev domain.NormalizedEvent) IngestResult {
 	a.addGlobal(ev.Query, delta)
 
 	return IngestResult{Status: status, Raw: true, Score: scoreDelta > 0}
+}
+
+func (a *Aggregator) Rotate(now time.Time) {
+	cutoff := bucketEpoch(now.Unix(), a.bucketSec) - a.windowSec
+	for i := range a.buckets {
+		b := &a.buckets[i]
+		b.mu.Lock()
+		if b.epoch != 0 && b.epoch <= cutoff {
+			a.expireBucketLocked(b)
+		}
+		b.mu.Unlock()
+	}
+}
+
+func (a *Aggregator) expireBucketLocked(b *bucket) {
+	for query, delta := range b.countDelta {
+		a.subGlobal(query, delta)
+	}
+	for key, expiresAt := range b.votesIssued {
+		a.seen.deleteIfValue(key, expiresAt)
+	}
+	clear(b.countDelta)
+	clear(b.votesIssued)
+	b.epoch = 0
+}
+
+func (a *Aggregator) subGlobal(query string, delta Counters) {
+	sh := a.shard(query)
+	sh.mu.Lock()
+	c := sh.counts[query]
+	c.Raw -= delta.Raw
+	c.Score -= delta.Score
+	if c.Raw <= 0 && c.Score <= 0 {
+		delete(sh.counts, query)
+	} else {
+		sh.counts[query] = c
+	}
+	sh.mu.Unlock()
 }
 
 func (a *Aggregator) addGlobal(query string, delta Counters) {
