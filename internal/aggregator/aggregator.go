@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/FCS-Seva/go-trends-aggregator/internal/domain"
 )
 
 type Counters struct {
@@ -89,6 +91,51 @@ func New(cfg Config) *Aggregator {
 		a.shards[i].counts = make(map[string]Counters)
 	}
 	return a
+}
+
+func (a *Aggregator) Ingest(ev domain.NormalizedEvent) IngestResult {
+	nowSec := a.clock().Unix()
+	eventSec := ev.Timestamp.Unix()
+	if eventSec <= nowSec-a.windowSec {
+		return IngestResult{Status: StatusExpired}
+	}
+	if eventSec > nowSec {
+		return IngestResult{Status: StatusFuture}
+	}
+
+	key := voteKey(ev.ActorID, ev.Query)
+	expiresAt := bucketEpoch(eventSec, a.bucketSec) + a.windowSec
+	epoch := bucketEpoch(eventSec, a.bucketSec)
+
+	scoreDelta := int64(0)
+	status := StatusDuplicate
+	if a.seen.tryVote(key, eventSec, expiresAt) {
+		scoreDelta = 1
+		status = StatusAccepted
+	}
+
+	b := &a.buckets[a.bucketIndex(epoch)]
+	b.mu.Lock()
+	if b.epoch != epoch {
+		b.epoch = epoch
+	}
+	delta := Counters{Raw: 1, Score: scoreDelta}
+	addCounters(b.countDelta, ev.Query, delta)
+	if scoreDelta > 0 {
+		b.votesIssued[key] = expiresAt
+	}
+	b.mu.Unlock()
+
+	a.addGlobal(ev.Query, delta)
+
+	return IngestResult{Status: status, Raw: true, Score: scoreDelta > 0}
+}
+
+func (a *Aggregator) addGlobal(query string, delta Counters) {
+	sh := a.shard(query)
+	sh.mu.Lock()
+	addCounters(sh.counts, query, delta)
+	sh.mu.Unlock()
 }
 
 func (a *Aggregator) UniqueQueries() int {
