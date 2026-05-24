@@ -1,7 +1,9 @@
 package aggregator
 
 import (
+	"container/heap"
 	"hash/fnv"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -177,6 +179,44 @@ func (a *Aggregator) addGlobal(query string, delta Counters) {
 	sh.mu.Unlock()
 }
 
+func (a *Aggregator) BuildSnapshot(stop func(string) bool, limit int, now time.Time) *Snapshot {
+	if limit <= 0 {
+		limit = 1
+	}
+	h := &entryHeap{}
+	heap.Init(h)
+	for i := range a.shards {
+		sh := &a.shards[i]
+		sh.mu.RLock()
+		for query, counters := range sh.counts {
+			if counters.Score <= 0 {
+				continue
+			}
+			if stop != nil && stop(query) {
+				continue
+			}
+			entry := Entry{Query: query, Score: counters.Score, Raw: counters.Raw}
+			if h.Len() < limit {
+				heap.Push(h, entry)
+				continue
+			}
+			if lessEntry((*h)[0], entry) {
+				heap.Pop(h)
+				heap.Push(h, entry)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	items := make([]Entry, h.Len())
+	for i := len(items) - 1; i >= 0; i-- {
+		items[i] = heap.Pop(h).(Entry)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return betterEntry(items[i], items[j])
+	})
+	return &Snapshot{Top: items, UpdatedAt: now, WindowSeconds: a.windowSec}
+}
+
 func (a *Aggregator) UniqueQueries() int {
 	total := 0
 	for i := range a.shards {
@@ -245,6 +285,44 @@ func (s *SnapshotStore) Store(snapshot *Snapshot) {
 
 func (s *SnapshotStore) Load() *Snapshot {
 	return s.ptr.Load()
+}
+
+type entryHeap []Entry
+
+func (h entryHeap) Len() int { return len(h) }
+func (h entryHeap) Less(i, j int) bool {
+	return lessEntry(h[i], h[j])
+}
+func (h entryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *entryHeap) Push(x any) {
+	*h = append(*h, x.(Entry))
+}
+func (h *entryHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+func lessEntry(a, b Entry) bool {
+	if a.Score != b.Score {
+		return a.Score < b.Score
+	}
+	if a.Raw != b.Raw {
+		return a.Raw < b.Raw
+	}
+	return a.Query > b.Query
+}
+
+func betterEntry(a, b Entry) bool {
+	if a.Score != b.Score {
+		return a.Score > b.Score
+	}
+	if a.Raw != b.Raw {
+		return a.Raw > b.Raw
+	}
+	return a.Query < b.Query
 }
 
 type seenVotes struct {
