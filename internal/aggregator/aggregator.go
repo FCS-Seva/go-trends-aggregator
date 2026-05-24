@@ -40,6 +40,7 @@ type Aggregator struct {
 	bucketSec int64
 	buckets   []bucket
 	shards    []countShard
+	seen      *seenVotes
 	clock     func() time.Time
 }
 
@@ -77,6 +78,7 @@ func New(cfg Config) *Aggregator {
 		bucketSec: int64(cfg.BucketDuration / time.Second),
 		buckets:   make([]bucket, bucketCount),
 		shards:    make([]countShard, cfg.ShardCount),
+		seen:      newSeenVotes(cfg.ShardCount),
 		clock:     cfg.Clock,
 	}
 	for i := range a.buckets {
@@ -157,4 +159,41 @@ func (s *SnapshotStore) Store(snapshot *Snapshot) {
 
 func (s *SnapshotStore) Load() *Snapshot {
 	return s.ptr.Load()
+}
+
+type seenVotes struct {
+	shards []seenShard
+}
+
+type seenShard struct {
+	mu sync.Mutex
+	m  map[string]int64
+}
+
+func newSeenVotes(shardCount int) *seenVotes {
+	s := &seenVotes{shards: make([]seenShard, shardCount)}
+	for i := range s.shards {
+		s.shards[i].m = make(map[string]int64)
+	}
+	return s
+}
+
+func (s *seenVotes) tryVote(key string, eventSec, expiresAt int64) bool {
+	sh := &s.shards[hashString(key)%uint32(len(s.shards))]
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if exp, ok := sh.m[key]; ok && exp > eventSec {
+		return false
+	}
+	sh.m[key] = expiresAt
+	return true
+}
+
+func (s *seenVotes) deleteIfValue(key string, expiresAt int64) {
+	sh := &s.shards[hashString(key)%uint32(len(s.shards))]
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if exp, ok := sh.m[key]; ok && exp == expiresAt {
+		delete(sh.m, key)
+	}
 }
