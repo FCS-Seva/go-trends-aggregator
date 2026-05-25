@@ -50,6 +50,7 @@ func (c *NATSConsumer) Run(ctx context.Context) error {
 	}
 
 	msgs := make(chan jetstream.Msg, c.cfg.QueueCapacity)
+	go c.runConsumerMetrics(ctx, consumer, msgs)
 
 	var wg sync.WaitGroup
 	for i := 0; i < c.cfg.WorkerCount; i++ {
@@ -142,6 +143,33 @@ func (c *NATSConsumer) createEphemeralConsumer(ctx context.Context, stream jetst
 		return nil, fmt.Errorf("create ephemeral consumer: %w", err)
 	}
 	return consumer, nil
+}
+
+func (c *NATSConsumer) runConsumerMetrics(ctx context.Context, consumer jetstream.Consumer, msgs <-chan jetstream.Msg) {
+	queueTicker := time.NewTicker(250 * time.Millisecond)
+	defer queueTicker.Stop()
+	jsTicker := time.NewTicker(2 * time.Second)
+	defer jsTicker.Stop()
+
+	for {
+		select {
+		case <-queueTicker.C:
+			c.metrics.QueueDepth.Set(float64(len(msgs)))
+		case <-jsTicker.C:
+			infoCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+			info, err := consumer.Info(infoCtx)
+			cancel()
+			if err != nil {
+				c.log.Debug("consumer info", "error", err)
+				continue
+			}
+			c.metrics.JetStreamPending.Set(float64(info.NumPending))
+			c.metrics.JetStreamAckPending.Set(float64(info.NumAckPending))
+			c.metrics.JetStreamWaiting.Set(float64(info.NumWaiting))
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *NATSConsumer) handleMessage(ctx context.Context, msg jetstream.Msg) {
