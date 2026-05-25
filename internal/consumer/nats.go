@@ -127,12 +127,15 @@ func (c *NATSConsumer) ensureStream(ctx context.Context, js jetstream.JetStream)
 }
 
 func (c *NATSConsumer) createEphemeralConsumer(ctx context.Context, stream jetstream.Stream) (jetstream.Consumer, error) {
+	start := time.Now().Add(-c.cfg.WindowDuration - c.cfg.LatenessTolerance)
 	consumer, err := stream.CreateConsumer(ctx, jetstream.ConsumerConfig{
-		DeliverPolicy:     jetstream.DeliverNewPolicy,
+		DeliverPolicy:     jetstream.DeliverByStartTimePolicy,
+		OptStartTime:      &start,
 		AckPolicy:         jetstream.AckExplicitPolicy,
 		AckWait:           c.cfg.NATSAckWait,
 		MaxAckPending:     c.cfg.MaxAckPending,
 		FilterSubject:     c.cfg.NATSFilter,
+		ReplayPolicy:      jetstream.ReplayInstantPolicy,
 		InactiveThreshold: 10 * time.Minute,
 	})
 	if err != nil {
