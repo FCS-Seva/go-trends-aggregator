@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/nats-io/nats.go"
@@ -41,19 +42,19 @@ func main() {
 		log.Fatal(err)
 	}
 	defer nc.Close()
-	js, err := jetstream.New(nc)
+	var asyncErrors atomic.Int64
+	js, err := jetstream.New(
+		nc,
+		jetstream.WithPublishAsyncMaxPending(max(1_000, rps*2)),
+		jetstream.WithPublishAsyncErrHandler(func(_ jetstream.JetStream, _ *nats.Msg, err error) {
+			asyncErrors.Add(1)
+			log.Printf("async publish: %v", err)
+		}),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	if _, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      streamName,
-		Subjects:  []string{subjectPrefix + ".*"},
-		Retention: jetstream.LimitsPolicy,
-		Storage:   jetstream.FileStorage,
-		MaxAge:    10 * time.Minute,
-	}); err != nil {
-		log.Fatal(err)
-	}
+	waitForStream(ctx, js, streamName)
 
 	interval := time.Second / time.Duration(rps)
 	if interval <= 0 {
@@ -77,7 +78,7 @@ func main() {
 			event := nextEvent(sent)
 			body, _ := json.Marshal(event)
 			subject := fmt.Sprintf("%s.%d", subjectPrefix, shard(event.ActorID, 16))
-			if _, err := js.Publish(ctx, subject, body); err != nil {
+			if _, err := js.PublishAsync(subject, body); err != nil {
 				log.Printf("publish: %v", err)
 				continue
 			}
@@ -86,9 +87,38 @@ func main() {
 				log.Printf("sent=%d", sent)
 			}
 		case <-deadline:
-			log.Printf("done, sent=%d", sent)
+			waitAsyncComplete(js)
+			log.Printf("done, sent=%d async_errors=%d", sent, asyncErrors.Load())
 			return
 		}
+	}
+}
+
+func waitForStream(ctx context.Context, js jetstream.JetStream, streamName string) {
+	deadline, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		_, err := js.Stream(deadline, streamName)
+		if err == nil {
+			return
+		}
+		select {
+		case <-ticker.C:
+			log.Printf("waiting for stream %s: %v", streamName, err)
+		case <-deadline.Done():
+			log.Fatalf("stream %s is not available: %v", streamName, err)
+		}
+	}
+}
+
+func waitAsyncComplete(js jetstream.JetStream) {
+	select {
+	case <-js.PublishAsyncComplete():
+	case <-time.After(10 * time.Second):
+		log.Printf("async publish flush timed out, pending=%d", js.PublishAsyncPending())
 	}
 }
 
