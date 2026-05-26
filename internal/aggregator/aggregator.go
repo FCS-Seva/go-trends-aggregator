@@ -108,6 +108,13 @@ func (a *Aggregator) Ingest(ev domain.NormalizedEvent) IngestResult {
 	key := voteKey(ev.ActorID, ev.Query)
 	expiresAt := bucketEpoch(eventSec, a.bucketSec) + a.windowSec
 	epoch := bucketEpoch(eventSec, a.bucketSec)
+	b := &a.buckets[a.bucketIndex(epoch)]
+
+	b.mu.Lock()
+	if b.epoch != epoch {
+		a.expireBucketLocked(b)
+		b.epoch = epoch
+	}
 
 	scoreDelta := int64(0)
 	status := StatusDuplicate
@@ -116,20 +123,13 @@ func (a *Aggregator) Ingest(ev domain.NormalizedEvent) IngestResult {
 		status = StatusAccepted
 	}
 
-	b := &a.buckets[a.bucketIndex(epoch)]
-	b.mu.Lock()
-	if b.epoch != epoch {
-		a.expireBucketLocked(b)
-		b.epoch = epoch
-	}
 	delta := Counters{Raw: 1, Score: scoreDelta}
 	addCounters(b.countDelta, ev.Query, delta)
 	if scoreDelta > 0 {
 		b.votesIssued[key] = expiresAt
 	}
-	b.mu.Unlock()
-
 	a.addGlobal(ev.Query, delta)
+	b.mu.Unlock()
 
 	return IngestResult{Status: status, Raw: true, Score: scoreDelta > 0}
 }
@@ -144,39 +144,6 @@ func (a *Aggregator) Rotate(now time.Time) {
 		}
 		b.mu.Unlock()
 	}
-}
-
-func (a *Aggregator) expireBucketLocked(b *bucket) {
-	for query, delta := range b.countDelta {
-		a.subGlobal(query, delta)
-	}
-	for key, expiresAt := range b.votesIssued {
-		a.seen.deleteIfValue(key, expiresAt)
-	}
-	clear(b.countDelta)
-	clear(b.votesIssued)
-	b.epoch = 0
-}
-
-func (a *Aggregator) subGlobal(query string, delta Counters) {
-	sh := a.shard(query)
-	sh.mu.Lock()
-	c := sh.counts[query]
-	c.Raw -= delta.Raw
-	c.Score -= delta.Score
-	if c.Raw <= 0 && c.Score <= 0 {
-		delete(sh.counts, query)
-	} else {
-		sh.counts[query] = c
-	}
-	sh.mu.Unlock()
-}
-
-func (a *Aggregator) addGlobal(query string, delta Counters) {
-	sh := a.shard(query)
-	sh.mu.Lock()
-	addCounters(sh.counts, query, delta)
-	sh.mu.Unlock()
 }
 
 func (a *Aggregator) BuildSnapshot(stop func(string) bool, limit int, now time.Time) *Snapshot {
@@ -226,6 +193,39 @@ func (a *Aggregator) UniqueQueries() int {
 		sh.mu.RUnlock()
 	}
 	return total
+}
+
+func (a *Aggregator) expireBucketLocked(b *bucket) {
+	for query, delta := range b.countDelta {
+		a.subGlobal(query, delta)
+	}
+	for key, expiresAt := range b.votesIssued {
+		a.seen.deleteIfValue(key, expiresAt)
+	}
+	clear(b.countDelta)
+	clear(b.votesIssued)
+	b.epoch = 0
+}
+
+func (a *Aggregator) addGlobal(query string, delta Counters) {
+	sh := a.shard(query)
+	sh.mu.Lock()
+	addCounters(sh.counts, query, delta)
+	sh.mu.Unlock()
+}
+
+func (a *Aggregator) subGlobal(query string, delta Counters) {
+	sh := a.shard(query)
+	sh.mu.Lock()
+	c := sh.counts[query]
+	c.Raw -= delta.Raw
+	c.Score -= delta.Score
+	if c.Raw <= 0 && c.Score <= 0 {
+		delete(sh.counts, query)
+	} else {
+		sh.counts[query] = c
+	}
+	sh.mu.Unlock()
 }
 
 func (a *Aggregator) shard(query string) *countShard {

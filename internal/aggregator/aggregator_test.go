@@ -1,6 +1,9 @@
 package aggregator
 
 import (
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -90,6 +93,52 @@ func TestAggregatorSnapshotAppliesStoplist(t *testing.T) {
 	}
 }
 
+func TestAggregatorConcurrentIngestRotateKeepsCountersConsistent(t *testing.T) {
+	var nowSec atomic.Int64
+	nowSec.Store(1_000)
+	agg := New(Config{
+		WindowDuration: time.Second,
+		BucketDuration: time.Second,
+		ShardCount:     8,
+		Clock: func() time.Time {
+			return time.Unix(nowSec.Load(), 0)
+		},
+	})
+
+	const workers = 8
+	const iterations = 1_000
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			actor := fmt.Sprintf("u-%d", worker)
+			for j := 0; j < iterations; j++ {
+				sec := nowSec.Load()
+				agg.Ingest(event(actor, "q", time.Unix(sec, 0)))
+				if j%10 == 0 {
+					agg.Rotate(time.Unix(sec, 0))
+				}
+			}
+		}(i)
+	}
+
+	for tick := int64(1_001); tick < 1_050; tick++ {
+		nowSec.Store(tick)
+		agg.Rotate(time.Unix(tick, 0))
+		time.Sleep(100 * time.Microsecond)
+	}
+	wg.Wait()
+
+	agg.assertConsistent(t)
+	nowSec.Store(1_060)
+	agg.Rotate(time.Unix(1_060, 0))
+	agg.assertConsistent(t)
+	if got := agg.UniqueQueries(); got != 0 {
+		t.Fatalf("UniqueQueries() after full expiration = %d", got)
+	}
+}
+
 func testAggregator(now *time.Time, window time.Duration) *Aggregator {
 	return New(Config{
 		WindowDuration:    window,
@@ -108,5 +157,43 @@ func event(actor, query string, ts time.Time) domain.NormalizedEvent {
 		Query:     query,
 		ActorID:   actor,
 		Timestamp: ts,
+	}
+}
+
+func (a *Aggregator) assertConsistent(t *testing.T) {
+	t.Helper()
+	fromBuckets := make(map[string]Counters)
+	for i := range a.buckets {
+		b := &a.buckets[i]
+		b.mu.Lock()
+		for query, counters := range b.countDelta {
+			addCounters(fromBuckets, query, counters)
+			if counters.Raw < 0 || counters.Score < 0 {
+				t.Fatalf("negative bucket counters for %q: %+v", query, counters)
+			}
+		}
+		b.mu.Unlock()
+	}
+
+	fromGlobal := make(map[string]Counters)
+	for i := range a.shards {
+		sh := &a.shards[i]
+		sh.mu.RLock()
+		for query, counters := range sh.counts {
+			fromGlobal[query] = counters
+			if counters.Raw < 0 || counters.Score < 0 {
+				t.Fatalf("negative global counters for %q: %+v", query, counters)
+			}
+		}
+		sh.mu.RUnlock()
+	}
+
+	if len(fromBuckets) != len(fromGlobal) {
+		t.Fatalf("bucket/global query count mismatch: buckets=%v global=%v", fromBuckets, fromGlobal)
+	}
+	for query, bucketCounters := range fromBuckets {
+		if globalCounters, ok := fromGlobal[query]; !ok || globalCounters != bucketCounters {
+			t.Fatalf("counter mismatch for %q: bucket=%+v global=%+v ok=%v", query, bucketCounters, globalCounters, ok)
+		}
 	}
 }
