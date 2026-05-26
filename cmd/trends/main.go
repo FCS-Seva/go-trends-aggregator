@@ -54,6 +54,10 @@ func main() {
 		Addr:              cfg.HTTPAddr,
 		Handler:           httpapi.NewServer(snapshots, stop, m, cfg.MaxTopLimit),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16,
 	}
 	go func() {
 		log.Info("http server started", "addr", cfg.HTTPAddr)

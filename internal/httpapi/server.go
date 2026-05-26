@@ -49,7 +49,11 @@ func (s *Server) readyz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) trends(w http.ResponseWriter, r *http.Request) {
-	limit := parseLimit(r, s.maxTopLimit)
+	limit, ok := parseLimit(r, s.maxTopLimit)
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_limit"})
+		return
+	}
 	debug := r.URL.Query().Get("debug") == "true"
 	snapshot := s.snapshots.Load()
 	if snapshot == nil {
@@ -84,6 +88,7 @@ func (s *Server) getStoplist(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) addStoplist(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
 	defer r.Body.Close()
 
 	var req struct {
@@ -118,18 +123,19 @@ func (s *Server) deleteStoplist(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"term": normalized, "deleted": deleted})
 }
 
-func parseLimit(r *http.Request, maxLimit int) int {
+func parseLimit(r *http.Request, maxLimit int) (int, bool) {
 	limit := 20
 	if raw := r.URL.Query().Get("limit"); raw != "" {
 		n, err := strconv.Atoi(raw)
-		if err == nil && n > 0 {
-			limit = n
+		if err != nil || n < 1 {
+			return 0, false
 		}
+		limit = n
 	}
 	if limit > maxLimit {
-		return maxLimit
+		return maxLimit, true
 	}
-	return limit
+	return limit, true
 }
 
 func (s *Server) instrument(next http.Handler) http.Handler {
